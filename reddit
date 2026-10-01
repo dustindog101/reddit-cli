@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""reddit - search and read Reddit via the Arctic Shift archive API.
+
+No login, no API key. Data is near-live (usually < 5 min behind reddit.com)
+with full history back to 2005.
+
+Commands:
+  search "keywords" -s sub1,sub2 [-n 25] [--after YYYY-MM-DD] [--before YYYY-MM-DD]
+      Keyword search inside one or more subreddits (server requires a subreddit
+      scope; pass several comma-separated subs to cover a topic).
+  browse -s sub [-n 25]
+      Newest posts in a subreddit.
+  thread <post_id|url> [-n 30]
+      Post body plus top comments, score-sorted.
+  comments "keywords" -s sub [-n 25]
+      Search comment bodies.
+  user <username> [-n 25]
+      Recent posts and comments by a user.
+
+Examples:
+  reddit search "age of hemp" -s vaporents,drdabberofficial,Vaporents
+  reddit thread 1qva8r1
+  reddit thread https://www.reddit.com/r/vaporents/comments/1qva8r1/xyz/
+  reddit user spez -n 10
+"""
+
+import json
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+BASE = "https://arctic-shift.photon-reddit.com/api"
+POST_FIELDS = "id,title,subreddit,author,created_utc,score,num_comments,selftext,url"
+COMMENT_FIELDS = "id,author,body,score,created_utc,subreddit,link_id,parent_id"
+TIMEOUT = 30
+
+
+def die(msg):
+    print(f"reddit: error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def api(path, params, retries=4):
+    qs = urllib.parse.urlencode(params)
+    url = f"{BASE}{path}?{qs}"
+    req = urllib.request.Request(url, headers={"User-Agent": "reddit-cli/1.0"})
+    last = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                payload = json.load(r)
+            if payload.get("error"):
+                die(payload["error"])
+            return payload.get("data") or []
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (422, 429) and attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))  # volunteer-run service; back off
+                continue
+            die(f"request failed: HTTP {e.code}")
+        except Exception as e:
+            last = e
+            if attempt < retries - 1:
+                time.sleep(2)
+                continue
+            die(f"request failed: {last}")
+    die(f"request failed: {last}")
+
+
+def to_epoch(s):
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        die(f"bad date '{s}', use YYYY-MM-DD")
+    return int(dt.timestamp())
+
+
+def fmt_date(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def post_url(p):
+    return f"https://reddit.com/r/{p['subreddit']}/comments/{p['id']}/"
+
+
+def comment_url(c):
+    post_id = (c.get("link_id") or "").removeprefix("t3_")
+    return f"https://reddit.com/r/{c['subreddit']}/comments/{post_id}/_/{c['id']}/"
+
+
+def parse_id(s):
+    # accept bare id or full reddit url
+    m = re.search(r"/comments/([a-z0-9]+)/", s)
+    return m.group(1) if m else s.strip()
+
+
+def cmd_search(args):
+    if not args or args[0].startswith("-"):
+        die('usage: reddit search "keywords" -s sub1,sub2 [-n 25]')
+    query = args[0]
+    rest = args[1:]
+    subs, n, after, before = [], 25, None, None
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ("-s", "--subreddit") and i + 1 < len(rest):
+            subs = [s.strip() for s in rest[i + 1].split(",") if s.strip()]
+            i += 2
+        elif a in ("-n", "--limit") and i + 1 < len(rest):
+            n = int(rest[i + 1]); i += 2
+        elif a == "--after" and i + 1 < len(rest):
+            after = to_epoch(rest[i + 1]); i += 2
+        elif a == "--before" and i + 1 < len(rest):
+            before = to_epoch(rest[i + 1]); i += 2
+        else:
+            i += 1
+    if not subs:
+        die("search needs -s subreddit (the archive has no global keyword index)")
+    seen = set()
+    per = max(1, min(n, 100) // max(1, len(subs)))
+    for sub in subs:
+        params = {"subreddit": sub, "query": query, "limit": per, "sort": "desc"}
+        if after:
+            params["after"] = after
+        if before:
+            params["before"] = before
+        for p in api("/posts/search", {**params, "fields": POST_FIELDS}):
+            if p["id"] in seen:
+                continue
+            seen.add(p["id"])
+            print(f"{fmt_date(p['created_utc'])}  r/{p['subreddit']}  "
+                  f"score {p['score']}  {p['num_comments']} comments  u/{p['author']}")
+            print(f"  {p['title']}")
+            if p.get("selftext"):
+                print(f"  {p['selftext'][:200].replace(chr(10), ' ')}")
+            print(f"  {post_url(p)}")
+            print()
+        time.sleep(0.5)  # be polite to the volunteer-run service
+
+
+def cmd_browse(args):
+    subs, n = [], 25
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-s", "--subreddit") and i + 1 < len(args):
+            subs = [s.strip() for s in args[i + 1].split(",") if s.strip()]
+            i += 2
+        elif a in ("-n", "--limit") and i + 1 < len(args):
+            n = int(args[i + 1]); i += 2
+        else:
+            i += 1
+    if not subs:
+        die("usage: reddit browse -s sub1,sub2 [-n 25]")
+    per = max(1, min(n, 100) // max(1, len(subs)))
+    for sub in subs:
+        print(f"### r/{sub}")
+        for p in api("/posts/search", {"subreddit": sub, "limit": per, "sort": "desc", "fields": POST_FIELDS}):
+            print(f"{fmt_date(p['created_utc'])}  score {p['score']}  {p['num_comments']} comments")
+            print(f"  {p['title']}")
+            print(f"  {post_url(p)}")
+            print()
+        time.sleep(0.5)
+
+
+def cmd_thread(args):
+    if not args:
+        die("usage: reddit thread <post_id|url> [-n 30]")
+    pid = parse_id(args[0])
+    n = 30
+    if "-n" in args:
+        n = int(args[args.index("-n") + 1])
+    posts = api("/posts/ids", {"ids": pid, "fields": POST_FIELDS})
+    comments = api("/comments/search", {"link_id": pid, "limit": 100, "sort": "desc", "fields": COMMENT_FIELDS})
+    if posts:
+        p = posts[0]
+        print(f"{p['title']}")
+        print(f"r/{p['subreddit']}  u/{p['author']}  {fmt_date(p['created_utc'])}  "
+              f"score {p['score']}  {p['num_comments']} comments")
+        print(f"{post_url(p)}")
+        if p.get("selftext"):
+            print()
+            print(p["selftext"][:2000])
+        print()
+        print("=" * 60)
+    comments.sort(key=lambda c: c.get("score", 0), reverse=True)
+    for c in comments[:n]:
+        body = (c.get("body") or "[no text]").replace("\n", " ")
+        print(f"u/{c['author']}  score {c['score']}  {fmt_date(c['created_utc'])}")
+        print(f"  {body[:600]}")
+        print()
+
+
+def cmd_comments(args):
+    if not args or args[0].startswith("-"):
+        die('usage: reddit comments "keywords" -s sub [-n 25]')
+    query = args[0]
+    rest = args[1:]
+    subs, n = [], 25
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ("-s", "--subreddit") and i + 1 < len(rest):
+            subs = [s.strip() for s in rest[i + 1].split(",") if s.strip()]
+            i += 2
+        elif a in ("-n", "--limit") and i + 1 < len(rest):
+            n = int(rest[i + 1]); i += 2
+        else:
+            i += 1
+    if not subs:
+        die("comment search needs -s subreddit")
+    per = max(1, min(n, 100) // max(1, len(subs)))
+    for sub in subs:
+        for c in api("/comments/search", {"subreddit": sub, "query": query,
+                                          "limit": per, "sort": "desc", "fields": COMMENT_FIELDS}):
+            body = (c.get("body") or "").replace("\n", " ")
+            print(f"{fmt_date(c['created_utc'])}  r/{c['subreddit']}  u/{c['author']}  score {c['score']}")
+            print(f"  {body[:300]}")
+            print(f"  {comment_url(c)}")
+            print()
+        time.sleep(0.5)
+
+
+def cmd_user(args):
+    if not args:
+        die("usage: reddit user <username> [-n 25]")
+    name = args[0]
+    n = int(args[args.index("-n") + 1]) if "-n" in args else 25
+    print(f"--- posts by u/{name} ---")
+    for p in api("/posts/search", {"author": name, "limit": min(n, 100), "sort": "desc", "fields": POST_FIELDS}):
+        print(f"{fmt_date(p['created_utc'])}  r/{p['subreddit']}  score {p['score']}")
+        print(f"  {p['title']}")
+        print(f"  {post_url(p)}")
+        print()
+    print(f"--- comments by u/{name} ---")
+    for c in api("/comments/search", {"author": name, "limit": min(n, 100), "sort": "desc", "fields": COMMENT_FIELDS}):
+        body = (c.get("body") or "").replace("\n", " ")
+        print(f"{fmt_date(c['created_utc'])}  r/{c['subreddit']}  score {c['score']}")
+        print(f"  {body[:300]}")
+        print(f"  {comment_url(c)}")
+        print()
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd, args = sys.argv[1], sys.argv[2:]
+    {"search": cmd_search, "browse": cmd_browse, "thread": cmd_thread,
+     "comments": cmd_comments, "user": cmd_user}.get(cmd, lambda a: die(
+        f"unknown command '{cmd}' (try: search, browse, thread, comments, user)"))(args)
+
+
+if __name__ == "__main__":
+    main()
