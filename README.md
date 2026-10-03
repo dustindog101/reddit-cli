@@ -13,14 +13,23 @@ It's a single Python file, standard library only. No dependencies, nothing to co
 - **Search comment bodies**, not just post titles
 - **User lookup** — anyone's recent posts and comments
 - **Browse** the newest posts in a subreddit
-- **Date-bounded search** (`--after` / `--before`)
-- **Agent-friendly** — stable, greppable plain-text output; no auth tokens to manage, so it drops straight into scripts and AI agent toolchains
+- **Date-bounded search, browse, and user lookup** (`--after` / `--before`, dates or unix seconds)
+- **Agent-friendly** — plain text by default, or JSON lines with global `--json`; no auth tokens to manage, so it drops straight into scripts and AI agent toolchains
 
 ## Install
 
 ```bash
+mkdir -p ~/.local/bin
 curl -sL https://raw.githubusercontent.com/dustindog101/reddit-cli/main/reddit -o ~/.local/bin/reddit
 chmod +x ~/.local/bin/reddit
+```
+
+For a checkout you can update with Git:
+
+```bash
+mkdir -p ~/coding/projects ~/.local/bin
+git clone https://github.com/dustindog101/reddit-cli.git ~/coding/projects/reddit-cli
+ln -s ~/coding/projects/reddit-cli/reddit ~/.local/bin/reddit
 ```
 
 (make sure `~/.local/bin` is on your `PATH`. Or `git clone` the repo and symlink `reddit` anywhere on your `PATH`.)
@@ -55,12 +64,59 @@ reddit search "rust async" -s rust --after 2024-01-01 --before 2024-06-01
 | Command | What it does |
 |---|---|
 | `reddit search "query" -s sub1,sub2 [-n 25] [--after DATE] [--before DATE]` | Keyword search inside subreddits |
-| `reddit browse -s sub1,sub2 [-n 25]` | Newest posts in subreddits |
+| `reddit browse -s sub1,sub2 [-n 25] [--after DATE] [--before DATE]` | Newest posts in subreddits |
 | `reddit thread <post_id\|url> [-n 30]` | Post body + top comments, score-sorted |
 | `reddit comments "query" -s sub [-n 25]` | Search comment bodies |
-| `reddit user <username> [-n 25]` | Recent posts and comments by a user |
+| `reddit user <username> [-n 25] [--after DATE] [--before DATE]` | Recent posts and comments by a user |
 
-Dates use `YYYY-MM-DD` and are UTC.
+`--after` and `--before` accept UTC dates (`YYYY-MM-DD`, midnight UTC) or
+integer unix timestamps in seconds. `user` applies the window to both posts
+and comments. Limits and archive coverage still apply; a window does not imply
+an exhaustive export.
+
+```bash
+# Historical window in r/UMBC
+reddit browse -s UMBC --after 2024-01-01 --before 2024-02-01 --json
+
+# Last seven days, using portable Python timestamp calculation
+now=$(python3 -c 'import time; print(int(time.time()))')
+reddit --json browse -s UMBC --after "$((now - 7 * 86400))" --before "$now"
+
+# The same bounds work for a user's posts AND comments
+reddit user spez --after 1704067200 --before 1706745600 --json
+```
+
+## JSON lines and errors
+
+Every command accepts `--json`, before or after the command. It emits one JSON
+object per post or comment with no headings or blank lines. Empty results produce
+no stdout. JSON preserves complete bodies and embedded newlines (escaped on one
+line), so callers can process archive records without parsing the text display.
+
+All objects contain `id`, `kind`, `subreddit`, `author`, `title`, `body`,
+`created_utc`, `permalink`, `score`, and `num_comments`:
+
+- Posts use `id: "t3_<id>"`, `kind: "post"`, and `body` from `selftext`.
+- Comments use `id: "t1_<id>"`, `kind: "comment"`; `title` and `num_comments`
+  are `null` because those fields do not apply to comments.
+- `created_utc` is unix seconds. Permalinks start with `https://www.reddit.com/`.
+  Unavailable archive fields are `null`; missing bodies are empty strings.
+- `thread --json` emits the post followed by comments sorted by score.
+  `user --json` emits posts followed by comments.
+
+Network, HTTP, and API errors exit with status 1 and a message on stderr. Error
+messages never go to stdout. Requests retain bounded retries and rate-limit
+backoff. If a later request fails, stdout may already contain earlier records;
+check the exit status before treating an export as complete.
+
+## Development checks
+
+The CLI and regression tests use only the Python standard library:
+
+```bash
+python3 -B -m unittest discover -s tests -v
+reddit browse -s UMBC -n 3 --after 2024-01-01 --before 2024-02-01 --json
+```
 
 ## Notes and limitations
 

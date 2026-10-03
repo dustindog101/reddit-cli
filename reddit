@@ -4,17 +4,20 @@
 No login, no API key. Data is near-live (usually < 5 min behind reddit.com)
 with full history back to 2005.
 
+Global option:
+  --json  Emit JSON lines (one object per post or comment), before or after command.
+
 Commands:
-  search "keywords" -s sub1,sub2 [-n 25] [--after YYYY-MM-DD] [--before YYYY-MM-DD]
+  search "keywords" -s sub1,sub2 [-n 25] [--after DATE|TIMESTAMP] [--before DATE|TIMESTAMP]
       Keyword search inside one or more subreddits (server requires a subreddit
       scope; pass several comma-separated subs to cover a topic).
-  browse -s sub [-n 25]
+  browse -s sub [-n 25] [--after DATE|TIMESTAMP] [--before DATE|TIMESTAMP]
       Newest posts in a subreddit.
   thread <post_id|url> [-n 30]
       Post body plus top comments, score-sorted.
   comments "keywords" -s sub [-n 25]
       Search comment bodies.
-  user <username> [-n 25]
+  user <username> [-n 25] [--after DATE|TIMESTAMP] [--before DATE|TIMESTAMP]
       Recent posts and comments by a user.
 
 Examples:
@@ -28,6 +31,7 @@ import json
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -47,7 +51,7 @@ def api(path, params, retries=4):
     qs = urllib.parse.urlencode(params)
     url = f"{BASE}{path}?{qs}"
     req = urllib.request.Request(url, headers={"User-Agent": "reddit-cli/1.0"})
-    last = None
+    last: object = None
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
@@ -61,7 +65,7 @@ def api(path, params, retries=4):
                 time.sleep(5 * (attempt + 1))  # volunteer-run service; back off
                 continue
             die(f"request failed: HTTP {e.code}")
-        except Exception as e:
+        except (urllib.error.URLError, OSError, ValueError) as e:
             last = e
             if attempt < retries - 1:
                 time.sleep(2)
@@ -71,11 +75,50 @@ def api(path, params, retries=4):
 
 
 def to_epoch(s):
+    if re.fullmatch(r"-?\d+", s):
+        return int(s)
     try:
         dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except ValueError:
-        die(f"bad date '{s}', use YYYY-MM-DD")
+        die(f"bad date '{s}', use YYYY-MM-DD or a unix timestamp in seconds")
     return int(dt.timestamp())
+
+
+def date_bounds(args):
+    params = {}
+    for flag in ("--after", "--before"):
+        if flag in args:
+            i = args.index(flag)
+            if i + 1 >= len(args):
+                die(f"{flag} requires YYYY-MM-DD or a unix timestamp in seconds")
+            params[flag[2:]] = to_epoch(args[i + 1])
+    return params
+
+
+def print_json(item, kind):
+    prefix = "t3_" if kind == "post" else "t1_"
+    item_id = str(item["id"]).removeprefix(prefix)
+    # Comments have no title or comment count; keep the schema stable with nulls.
+    print(
+        json.dumps(
+            {
+                "id": prefix + item_id,
+                "kind": kind,
+                "subreddit": item.get("subreddit"),
+                "author": item.get("author"),
+                "title": item.get("title") if kind == "post" else None,
+                "body": (item.get("selftext") if kind == "post" else item.get("body"))
+                or "",
+                "created_utc": item.get("created_utc"),
+                "permalink": (
+                    post_url(item) if kind == "post" else comment_url(item)
+                ).replace("https://reddit.com/", "https://www.reddit.com/"),
+                "score": item.get("score"),
+                "num_comments": item.get("num_comments") if kind == "post" else None,
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 def fmt_date(ts):
@@ -97,7 +140,7 @@ def parse_id(s):
     return m.group(1) if m else s.strip()
 
 
-def cmd_search(args):
+def cmd_search(args, json_output=False):
     if not args or args[0].startswith("-"):
         die('usage: reddit search "keywords" -s sub1,sub2 [-n 25]')
     query = args[0]
@@ -110,11 +153,14 @@ def cmd_search(args):
             subs = [s.strip() for s in rest[i + 1].split(",") if s.strip()]
             i += 2
         elif a in ("-n", "--limit") and i + 1 < len(rest):
-            n = int(rest[i + 1]); i += 2
+            n = int(rest[i + 1])
+            i += 2
         elif a == "--after" and i + 1 < len(rest):
-            after = to_epoch(rest[i + 1]); i += 2
+            after = to_epoch(rest[i + 1])
+            i += 2
         elif a == "--before" and i + 1 < len(rest):
-            before = to_epoch(rest[i + 1]); i += 2
+            before = to_epoch(rest[i + 1])
+            i += 2
         else:
             i += 1
     if not subs:
@@ -123,16 +169,21 @@ def cmd_search(args):
     per = max(1, min(n, 100) // max(1, len(subs)))
     for sub in subs:
         params = {"subreddit": sub, "query": query, "limit": per, "sort": "desc"}
-        if after:
+        if after is not None:
             params["after"] = after
-        if before:
+        if before is not None:
             params["before"] = before
         for p in api("/posts/search", {**params, "fields": POST_FIELDS}):
             if p["id"] in seen:
                 continue
             seen.add(p["id"])
-            print(f"{fmt_date(p['created_utc'])}  r/{p['subreddit']}  "
-                  f"score {p['score']}  {p['num_comments']} comments  u/{p['author']}")
+            if json_output:
+                print_json(p, "post")
+                continue
+            print(
+                f"{fmt_date(p['created_utc'])}  r/{p['subreddit']}  "
+                f"score {p['score']}  {p['num_comments']} comments  u/{p['author']}"
+            )
             print(f"  {p['title']}")
             if p.get("selftext"):
                 print(f"  {p['selftext'][:200].replace(chr(10), ' ')}")
@@ -141,7 +192,8 @@ def cmd_search(args):
         time.sleep(0.5)  # be polite to the volunteer-run service
 
 
-def cmd_browse(args):
+def cmd_browse(args, json_output=False):
+    bounds = date_bounds(args)
     subs, n = [], 25
     i = 0
     while i < len(args):
@@ -150,23 +202,39 @@ def cmd_browse(args):
             subs = [s.strip() for s in args[i + 1].split(",") if s.strip()]
             i += 2
         elif a in ("-n", "--limit") and i + 1 < len(args):
-            n = int(args[i + 1]); i += 2
+            n = int(args[i + 1])
+            i += 2
         else:
             i += 1
     if not subs:
         die("usage: reddit browse -s sub1,sub2 [-n 25]")
     per = max(1, min(n, 100) // max(1, len(subs)))
     for sub in subs:
-        print(f"### r/{sub}")
-        for p in api("/posts/search", {"subreddit": sub, "limit": per, "sort": "desc", "fields": POST_FIELDS}):
-            print(f"{fmt_date(p['created_utc'])}  score {p['score']}  {p['num_comments']} comments")
+        if not json_output:
+            print(f"### r/{sub}")
+        for p in api(
+            "/posts/search",
+            {
+                "subreddit": sub,
+                "limit": per,
+                "sort": "desc",
+                "fields": POST_FIELDS,
+                **bounds,
+            },
+        ):
+            if json_output:
+                print_json(p, "post")
+                continue
+            print(
+                f"{fmt_date(p['created_utc'])}  score {p['score']}  {p['num_comments']} comments"
+            )
             print(f"  {p['title']}")
             print(f"  {post_url(p)}")
             print()
         time.sleep(0.5)
 
 
-def cmd_thread(args):
+def cmd_thread(args, json_output=False):
     if not args:
         die("usage: reddit thread <post_id|url> [-n 30]")
     pid = parse_id(args[0])
@@ -174,12 +242,20 @@ def cmd_thread(args):
     if "-n" in args:
         n = int(args[args.index("-n") + 1])
     posts = api("/posts/ids", {"ids": pid, "fields": POST_FIELDS})
-    comments = api("/comments/search", {"link_id": pid, "limit": 100, "sort": "desc", "fields": COMMENT_FIELDS})
+    comments = api(
+        "/comments/search",
+        {"link_id": pid, "limit": 100, "sort": "desc", "fields": COMMENT_FIELDS},
+    )
     if posts:
         p = posts[0]
+        if json_output:
+            print_json(p, "post")
+    if posts and not json_output:
         print(f"{p['title']}")
-        print(f"r/{p['subreddit']}  u/{p['author']}  {fmt_date(p['created_utc'])}  "
-              f"score {p['score']}  {p['num_comments']} comments")
+        print(
+            f"r/{p['subreddit']}  u/{p['author']}  {fmt_date(p['created_utc'])}  "
+            f"score {p['score']}  {p['num_comments']} comments"
+        )
         print(f"{post_url(p)}")
         if p.get("selftext"):
             print()
@@ -188,13 +264,16 @@ def cmd_thread(args):
         print("=" * 60)
     comments.sort(key=lambda c: c.get("score", 0), reverse=True)
     for c in comments[:n]:
+        if json_output:
+            print_json(c, "comment")
+            continue
         body = (c.get("body") or "[no text]").replace("\n", " ")
         print(f"u/{c['author']}  score {c['score']}  {fmt_date(c['created_utc'])}")
         print(f"  {body[:600]}")
         print()
 
 
-def cmd_comments(args):
+def cmd_comments(args, json_output=False):
     if not args or args[0].startswith("-"):
         die('usage: reddit comments "keywords" -s sub [-n 25]')
     query = args[0]
@@ -207,36 +286,79 @@ def cmd_comments(args):
             subs = [s.strip() for s in rest[i + 1].split(",") if s.strip()]
             i += 2
         elif a in ("-n", "--limit") and i + 1 < len(rest):
-            n = int(rest[i + 1]); i += 2
+            n = int(rest[i + 1])
+            i += 2
         else:
             i += 1
     if not subs:
         die("comment search needs -s subreddit")
     per = max(1, min(n, 100) // max(1, len(subs)))
     for sub in subs:
-        for c in api("/comments/search", {"subreddit": sub, "query": query,
-                                          "limit": per, "sort": "desc", "fields": COMMENT_FIELDS}):
+        for c in api(
+            "/comments/search",
+            {
+                "subreddit": sub,
+                "body": query,
+                "limit": per,
+                "sort": "desc",
+                "fields": COMMENT_FIELDS,
+            },
+        ):
+            if json_output:
+                print_json(c, "comment")
+                continue
             body = (c.get("body") or "").replace("\n", " ")
-            print(f"{fmt_date(c['created_utc'])}  r/{c['subreddit']}  u/{c['author']}  score {c['score']}")
+            print(
+                f"{fmt_date(c['created_utc'])}  r/{c['subreddit']}  u/{c['author']}  score {c['score']}"
+            )
             print(f"  {body[:300]}")
             print(f"  {comment_url(c)}")
             print()
         time.sleep(0.5)
 
 
-def cmd_user(args):
+def cmd_user(args, json_output=False):
     if not args:
-        die("usage: reddit user <username> [-n 25]")
+        die(
+            "usage: reddit user <username> [-n 25] [--after DATE|TIMESTAMP] [--before DATE|TIMESTAMP]"
+        )
     name = args[0]
+    bounds = date_bounds(args)
     n = int(args[args.index("-n") + 1]) if "-n" in args else 25
-    print(f"--- posts by u/{name} ---")
-    for p in api("/posts/search", {"author": name, "limit": min(n, 100), "sort": "desc", "fields": POST_FIELDS}):
+    if not json_output:
+        print(f"--- posts by u/{name} ---")
+    for p in api(
+        "/posts/search",
+        {
+            "author": name,
+            "limit": min(n, 100),
+            "sort": "desc",
+            "fields": POST_FIELDS,
+            **bounds,
+        },
+    ):
+        if json_output:
+            print_json(p, "post")
+            continue
         print(f"{fmt_date(p['created_utc'])}  r/{p['subreddit']}  score {p['score']}")
         print(f"  {p['title']}")
         print(f"  {post_url(p)}")
         print()
-    print(f"--- comments by u/{name} ---")
-    for c in api("/comments/search", {"author": name, "limit": min(n, 100), "sort": "desc", "fields": COMMENT_FIELDS}):
+    if not json_output:
+        print(f"--- comments by u/{name} ---")
+    for c in api(
+        "/comments/search",
+        {
+            "author": name,
+            "limit": min(n, 100),
+            "sort": "desc",
+            "fields": COMMENT_FIELDS,
+            **bounds,
+        },
+    ):
+        if json_output:
+            print_json(c, "comment")
+            continue
         body = (c.get("body") or "").replace("\n", " ")
         print(f"{fmt_date(c['created_utc'])}  r/{c['subreddit']}  score {c['score']}")
         print(f"  {body[:300]}")
@@ -245,13 +367,24 @@ def cmd_user(args):
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+    json_output = "--json" in sys.argv[1:]
+    argv = [a for a in sys.argv[1:] if a != "--json"]
+    if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__)
         return
-    cmd, args = sys.argv[1], sys.argv[2:]
-    {"search": cmd_search, "browse": cmd_browse, "thread": cmd_thread,
-     "comments": cmd_comments, "user": cmd_user}.get(cmd, lambda a: die(
-        f"unknown command '{cmd}' (try: search, browse, thread, comments, user)"))(args)
+    cmd, args = argv[0], argv[1:]
+    {
+        "search": cmd_search,
+        "browse": cmd_browse,
+        "thread": cmd_thread,
+        "comments": cmd_comments,
+        "user": cmd_user,
+    }.get(
+        cmd,
+        lambda a, j: die(
+            f"unknown command '{cmd}' (try: search, browse, thread, comments, user)"
+        ),
+    )(args, json_output)
 
 
 if __name__ == "__main__":
